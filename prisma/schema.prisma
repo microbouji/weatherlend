@@ -1,0 +1,138 @@
+// Weatherlend data model.
+//
+// The domain rules live in one place on purpose: lib/loans.ts is the only
+// module allowed to create bookings and ledger entries, so the points
+// economy cannot drift out of sync with availability. The rules:
+//   - Phenomena and size categories are database rows, never hard-coded.
+//   - Balance is derived: welcome entry (+10) + SUM(ledger amounts).
+//     `balanceAfter` is denormalized per row so history renders cheaply.
+//   - A booking moves points immediately (borrower -X, lender +X) inside
+//     one transaction. There is no accept step in this prototype.
+//   - [from, to] is bookable iff it lies inside the offer's window AND
+//     overlaps no non-cancelled booking. Availability is always computed,
+//     never stored.
+//   - Days are hotel nights: end-exclusive, `to - from >= 1`.
+//   - All dates are clamped to the 2026/27 school year (see lib/dates.ts).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// A weather phenomenon users filter by, e.g. "Heat wave".
+// New phenomena are added as rows (seed or dashboard) — no code change.
+model Phenomenon {
+  id       Int       @id @default(autoincrement())
+  name     String    @unique
+  offers   Offer[]
+  requests Request[]
+}
+
+// Lending rate card: small = 1, medium = 2, large = 3 points per day.
+// Kept as data (like phenomena) so rates can change without code changes.
+model SizeCategory {
+  id           Int     @id @default(autoincrement())
+  key          String  @unique // "small" | "medium" | "large"
+  label        String // "Small"
+  pointsPerDay Int // 1 | 2 | 3
+  offers       Offer[]
+}
+
+// Demo user. There is no authentication in this prototype: the current user
+// is picked with the demo-user switcher (cookie `weatherlend_user`).
+// TODO(follow-up): replace with real auth. `email` is already here because
+// notifications will need it — nothing sends mail yet.
+model User {
+  id            Int           @id @default(autoincrement())
+  name          String
+  email         String        @unique
+  neighbourhood String
+  offers        Offer[]       @relation("Owner")
+  requests      Request[]     @relation("Requester")
+  borrowings    Booking[]     @relation("Borrower")
+  ledger        LedgerEntry[]
+  createdAt     DateTime      @default(now())
+}
+
+// Something a user offers to lend. Availability is ONE structured window;
+// bookings block sub-ranges of it (see Booking). Free-text nuance
+// ("short notice") belongs in `description`, not in the dates.
+model Offer {
+  id             Int          @id @default(autoincrement())
+  ownerId        Int
+  owner          User         @relation("Owner", fields: [ownerId], references: [id], onDelete: Cascade)
+  title          String
+  description    String?
+  sizeId         Int
+  size           SizeCategory @relation(fields: [sizeId], references: [id])
+  neighbourhood  String
+  availableFrom  DateTime
+  availableUntil DateTime
+  photoPath      String? // "/uploads/<file>" or null -> placeholder
+  phenomena      Phenomenon[]
+  bookings       Booking[]
+  createdAt      DateTime     @default(now())
+}
+
+// "I need X from … to …". Dates are optional: "next heat wave" has none,
+// in which case `periodNote` carries the meaning and the lender picks
+// concrete dates when fulfilling via "I have this".
+model Request {
+  id            Int         @id @default(autoincrement())
+  requesterId   Int
+  requester     User        @relation("Requester", fields: [requesterId], references: [id], onDelete: Cascade)
+  title         String
+  phenomenonId  Int
+  phenomenon    Phenomenon  @relation(fields: [phenomenonId], references: [id])
+  periodFrom    DateTime?
+  periodUntil   DateTime?
+  periodNote    String?
+  neighbourhood String
+  note          String?
+  status        String      @default("open") // "open" | "fulfilled" | "cancelled"
+  fulfillingBookingId Int?  @unique
+  fulfillingBooking Booking? @relation("Fulfils", fields: [fulfillingBookingId], references: [id])
+  createdAt     DateTime    @default(now())
+}
+
+// A loan of an offer for [from, to]. `pointsTotal` snapshots
+// days × size rate at booking time, so later rate changes never
+// rewrite history.
+model Booking {
+  id              Int       @id @default(autoincrement())
+  offerId         Int
+  offer           Offer     @relation(fields: [offerId], references: [id], onDelete: Cascade)
+  borrowerId      Int
+  borrower        User      @relation("Borrower", fields: [borrowerId], references: [id], onDelete: Cascade)
+  from            DateTime
+  to              DateTime
+  days            Int
+  pointsTotal     Int
+  status          String    @default("upcoming") // "upcoming" | "active" | "completed" | "cancelled"
+  fulfilledRequest Request? @relation("Fulfils")
+  ledgerEntries   LedgerEntry[]
+  createdAt       DateTime  @default(now())
+
+  @@index([offerId, from, to])
+}
+
+// One points movement. Positive = earned, negative = spent.
+// The welcome (+10) entry is written when a user is created, so
+// balance(user) = SUM(amount) over this table. Always.
+model LedgerEntry {
+  id           Int      @id @default(autoincrement())
+  userId       Int
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount       Int
+  reason       String // "welcome" | "lend" | "borrow" | "refund_lend" | "refund_borrow"
+  bookingId    Int?
+  booking      Booking? @relation(fields: [bookingId], references: [id], onDelete: SetNull)
+  balanceAfter Int // balance immediately after this movement (for history views)
+  createdAt    DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
