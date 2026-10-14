@@ -30,13 +30,9 @@ export function ensureDemoDatabase(): Promise<void> {
 }
 
 async function init(): Promise<void> {
-  // Hosts without a persistent disk (Vercel) have a read-only repo
-  // filesystem, so default to /tmp there even if no env vars were set.
-  // Explicitly configured values always win.
-  if (process.env.VERCEL) {
-    process.env.DATABASE_URL ??= "file:/tmp/weatherlend.db";
-    process.env.UPLOADS_DIR ??= "/tmp/weatherlend-uploads";
-  }
+  // UPLOADS_DIR default lives in lib/photos.ts; the DATABASE_URL default
+  // lives in lib/prisma.ts (it must be resolved before the client is
+  // constructed — see the comment there).
   console.log(`[weatherlend] boot: DATABASE_URL=${process.env.DATABASE_URL}`);
   try {
     if ((await prisma.user.count()) > 0) {
