@@ -14,7 +14,10 @@ const MAX_BYTES = 5 * 1024 * 1024;
 
 /** Where uploaded photos live. Overridable for hosts without a writable disk. */
 export function uploadsDir(): string {
-  return process.env.UPLOADS_DIR ?? join(process.cwd(), "data", "uploads");
+  return (
+    process.env.UPLOADS_DIR ??
+    (process.env.VERCEL ? "/tmp/weatherlend-uploads" : join(process.cwd(), "data", "uploads"))
+  );
 }
 const ALLOWED_TYPES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 const EXTENSIONS: Record<string, string> = {

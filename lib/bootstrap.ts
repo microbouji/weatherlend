@@ -1,18 +1,23 @@
-import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "./prisma";
 import { seedDatabase } from "./seed-data";
+import { MIGRATION, MIGRATIONS_TABLE, SCHEMA_STATEMENTS } from "./schema-sql";
 
-// Demo-hosting safety net, called once per server boot from app/layout.tsx.
+// Demo-hosting safety net, called once per server boot from
+// instrumentation.ts (and defensively from app/layout.tsx).
 //
 // Local development is unaffected: after `npm run setup` the database is
 // populated and this is a single cheap COUNT query. It only does work when
 // the database file exists but is empty (fresh ephemeral instance) or has
 // no tables yet (first boot on hosts without a persistent disk, e.g. Vercel):
-// then it applies the checked-in migrations and loads the sample data, so
-// the demo link works with zero manual steps on the server.
+// then it creates the schema and loads the sample data, so the demo link
+// works with zero manual steps on the server.
+//
+// The schema is applied as embedded SQL (lib/schema-sql.ts) rather than via
+// `prisma migrate deploy` because serverless functions don't ship the Prisma
+// CLI. The _prisma_migrations row carries the real checksum, so local
+// `migrate status/deploy` stays consistent afterwards.
 
 let pending: Promise<void> | null = null;
 
@@ -25,29 +30,56 @@ export function ensureDemoDatabase(): Promise<void> {
 }
 
 async function init(): Promise<void> {
+  // Hosts without a persistent disk (Vercel) have a read-only repo
+  // filesystem, so default to /tmp there even if no env vars were set.
+  // Explicitly configured values always win.
+  if (process.env.VERCEL) {
+    process.env.DATABASE_URL ??= "file:/tmp/weatherlend.db";
+    process.env.UPLOADS_DIR ??= "/tmp/weatherlend-uploads";
+  }
+  console.log(`[weatherlend] boot: DATABASE_URL=${process.env.DATABASE_URL}`);
   try {
-    if ((await prisma.user.count()) > 0) return;
+    if ((await prisma.user.count()) > 0) {
+      console.log("[weatherlend] boot: database already seeded");
+      return;
+    }
   } catch (error) {
-    // P2021 = table missing: fresh database file, migrate it, then continue.
+    // P2021 = table missing: fresh database file, create schema, then continue.
     const missingTable =
       error instanceof Prisma.PrismaClientKnownRequestError && error.code === "P2021";
     if (!missingTable) throw error;
-    runMigrations();
+    console.log("[weatherlend] boot: empty database, creating schema");
+    await applyEmbeddedSchema();
   }
+  console.log("[weatherlend] boot: seeding sample data");
   await seedDatabase();
+  console.log("[weatherlend] boot: ready");
 }
 
-function runMigrations(): void {
-  // Prefer the bundled CLI (fast); fall back to fetching it (demo hosts
-  // typically don't ship node_modules to serverless functions).
-  const bundled = join(process.cwd(), "node_modules", "prisma", "build", "index.js");
-  try {
-    if (existsSync(bundled)) {
-      execFileSync(process.execPath, [bundled, "migrate", "deploy"], { stdio: "inherit" });
-      return;
+/**
+ * Runs every statement of the init migration in one transaction (SQLite DDL
+ * is transactional: a failure rolls everything back and the next boot
+ * retries from scratch), then records the migration as applied.
+ */
+async function applyEmbeddedSchema(): Promise<void> {
+  await prisma.$transaction(async (tx) => {
+    for (const statement of SCHEMA_STATEMENTS) {
+      await tx.$executeRawUnsafe(statement);
     }
-  } catch {
-    // Fall through to npx.
-  }
-  execFileSync("npx", ["--yes", "prisma", "migrate", "deploy"], { stdio: "inherit" });
+    await tx.$executeRawUnsafe(MIGRATIONS_TABLE);
+    await tx.$executeRawUnsafe(
+      `INSERT INTO "_prisma_migrations"
+        ("id", "checksum", "finished_at", "migration_name", "logs", "rolled_back_at", "applied_steps_count")
+        VALUES (${param(randomUUID())}, ${param(MIGRATION.checksum)}, ${param(now())}, ${param(MIGRATION.name)}, '', NULL, ${MIGRATION.appliedStepsCount})`,
+    );
+  });
+}
+
+/** Inline a string literal safely into raw SQL (values only, never identifiers). */
+function param(value: string): string {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+function now(): string {
+  return new Date().toISOString().replace("T", " ").slice(0, 19);
 }
